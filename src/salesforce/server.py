@@ -2,14 +2,25 @@
 # dependencies = [
 #   "mcp",
 #   "simple-salesforce",
-#   "python-dotenv"
+#   "python-dotenv",
+#   "python-docx",
+#   "requests",
+#   "lxml",
+#   "pypdf"
 # ]
 # ///
 import asyncio
 import json
 from typing import Any, Optional
 import os
+import io
+import zipfile
 from dotenv import load_dotenv
+
+import requests
+from lxml import etree
+from docx import Document
+from pypdf import PdfReader
 
 from simple_salesforce import Salesforce
 from simple_salesforce.exceptions import SalesforceError
@@ -56,7 +67,7 @@ class SalesforceClient:
             return False
     
     def get_object_fields(self, object_name: str) -> str:
-        """Retrieves field Names, labels and typesfor a specific Salesforce object.
+        """Retrieves field Names, labels and types for a specific Salesforce object.
 
         Args:
             object_name (str): The name of the Salesforce object.
@@ -83,6 +94,78 @@ class SalesforceClient:
             
         return json.dumps(self.sobjects_cache[object_name], indent=2)
 
+    def download_content_version_text(self, content_version_id: str) -> str:
+        """Downloads a ContentVersion file and extracts text content.
+
+        Supports .docx files. Returns raw bytes as base64 for other types.
+
+        Args:
+            content_version_id (str): The Salesforce ContentVersion ID.
+
+        Returns:
+            str: Extracted text content.
+        """
+        if not self.sf:
+            raise ValueError("Salesforce connection not established.")
+
+        # Build the VersionData URL and fetch with session auth
+        instance_url = self.sf.base_url.split('/services')[0]
+        url = f"{instance_url}/services/data/v59.0/sobjects/ContentVersion/{content_version_id}/VersionData"
+        headers = {
+            "Authorization": f"Bearer {self.sf.session_id}",
+            "Content-Type": "application/octet-stream",
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        # Determine file type from ContentVersion metadata
+        cv_record = self.sf.query(
+            f"SELECT FileExtension FROM ContentVersion WHERE Id = '{content_version_id}'"
+        )
+        file_ext = ""
+        if cv_record['records']:
+            file_ext = (cv_record['records'][0].get('FileExtension') or "").lower()
+
+        if file_ext == "pdf":
+            reader = PdfReader(io.BytesIO(response.content))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text and text.strip():
+                    pages.append(text.strip())
+            return "\n\n".join(pages)
+
+        elif file_ext in ("docx",):
+            # Use lxml to do a full XML traversal — captures headers, footers,
+            # text boxes, table cells, and nested content that python-docx misses.
+            WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            W_P = f"{{{WORD_NS}}}p"
+            W_T = f"{{{WORD_NS}}}t"
+
+            all_parts = []
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                # Collect document body first, then headers/footers
+                targets = (
+                    ["word/document.xml"]
+                    + sorted(n for n in z.namelist()
+                             if n.startswith("word/header") and n.endswith(".xml"))
+                    + sorted(n for n in z.namelist()
+                             if n.startswith("word/footer") and n.endswith(".xml"))
+                )
+                for xml_name in targets:
+                    if xml_name not in z.namelist():
+                        continue
+                    tree = etree.fromstring(z.read(xml_name))
+                    for para in tree.iter(W_P):
+                        text = "".join(t.text or "" for t in para.iter(W_T))
+                        if text.strip():
+                            all_parts.append(text)
+            return "\n".join(all_parts)
+        else:
+            # Unsupported binary — return a message with size info
+            return f"[Binary file ({file_ext}, {len(response.content)} bytes) — text extraction not supported for this format]"
+
+
 # Create a server instance
 server = Server("salesforce-mcp")
 
@@ -93,8 +176,6 @@ load_dotenv()
 sf_client = SalesforceClient()
 if not sf_client.connect():
     print("Failed to initialize Salesforce connection")
-    # Optionally exit here if Salesforce is required
-    # sys.exit(1)
 
 # Add tool capabilities to run SOQL queries
 @server.list_tools()
@@ -310,6 +391,20 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["path"],
             },
         ),
+        types.Tool(
+            name="download_content_version",
+            description="Downloads a Salesforce ContentVersion file and extracts its text content. Supports .docx files. Use this to read Word documents attached to records.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content_version_id": {
+                        "type": "string",
+                        "description": "The Salesforce ContentVersion ID (starts with '068')",
+                    },
+                },
+                "required": ["content_version_id"],
+            },
+        ),
     ]
 
 @server.call_tool()
@@ -429,7 +524,6 @@ async def handle_call_tool(name: str, arguments: dict[str, str]) -> list[types.T
                 text=f"Tooling Execute Result (JSON):\n{json.dumps(results, indent=2)}",
             )
         ]
-
     elif name == "apex_execute":
         action = arguments.get("action")
         method = arguments.get("method", "GET")
@@ -465,9 +559,22 @@ async def handle_call_tool(name: str, arguments: dict[str, str]) -> list[types.T
                 text=f"RESTful API Call Result (JSON):\n{json.dumps(results, indent=2)}",
             )
         ]
+    elif name == "download_content_version":
+        content_version_id = arguments.get("content_version_id")
+        if not content_version_id:
+            raise ValueError("Missing 'content_version_id' argument")
+        if not sf_client.sf:
+            raise ValueError("Salesforce connection not established.")
+
+        text = sf_client.download_content_version_text(content_version_id)
+        return [
+            types.TextContent(
+                type="text",
+                text=f"ContentVersion {content_version_id} Text Content:\n\n{text}",
+            )
+        ]
     raise ValueError(f"Unknown tool: {name}")
 
-# Add prompt capabilities for common data analysis tasks
 
 async def run():
     async with mcp.server.stdio.stdio_server() as (read, write):
@@ -476,7 +583,7 @@ async def run():
             write,
             InitializationOptions(
                 server_name="salesforce-mcp",
-                server_version="0.1.5",
+                server_version="0.1.6",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
